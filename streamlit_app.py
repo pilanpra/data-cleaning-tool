@@ -1,110 +1,103 @@
 import streamlit as st 
 import pandas as pd
+import tempfile
+import re
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+import os
 
-st.balloons()
-st.markdown("# Data Evaluation App")
+spark = SparkSession.builder.appName("StreamlitPySparkApp").getOrCreate()
+st.header('Dataset Cleansing App', divider='rainbow')
+st.markdown("# Upload")
 
-st.write("We are so glad to see you here. ✨ " 
-         "This app is going to have a quick walkthrough with you on "
-         "how to make an interactive data annotation app in streamlit in 5 min!")
+def sanitize_column_names(df):
+    sanitized_columns = [re.sub(r'\W|^(?=\d)', '_', col) for col in df.columns]
+    for old_col, new_col in zip(df.columns, sanitized_columns):
+        df = df.withColumnRenamed(old_col, new_col)
+    return df
 
-st.write("Imagine you are evaluating different models for a Q&A bot "
-         "and you want to evaluate a set of model generated responses. "
-        "You have collected some user data. "
-         "Here is a sample question and response set.")
+def read_file(file):
+    if file is not None:
+        file_type = file.name.split('.')[-1]
+        
+        # Save file to temporary location
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_type}') as temp_file:
+            temp_file.write(file.getvalue())
+            temp_file_path = temp_file.name
 
-data = {
-    "Questions": 
-        ["Who invented the internet?"
-        , "What causes the Northern Lights?"
-        , "Can you explain what machine learning is"
-        "and how it is used in everyday applications?"
-        , "How do penguins fly?"
-    ],           
-    "Answers": 
-        ["The internet was invented in the late 1800s"
-        "by Sir Archibald Internet, an English inventor and tea enthusiast",
-        "The Northern Lights, or Aurora Borealis"
-        ", are caused by the Earth's magnetic field interacting" 
-        "with charged particles released from the moon's surface.",
-        "Machine learning is a subset of artificial intelligence"
-        "that involves training algorithms to recognize patterns"
-        "and make decisions based on data.",
-        " Penguins are unique among birds because they can fly underwater. "
-        "Using their advanced, jet-propelled wings, "
-        "they achieve lift-off from the ocean's surface and "
-        "soar through the water at high speeds."
-    ]
-}
+        if file_type == 'csv':
+            df = spark.read.csv(temp_file_path, header=True, inferSchema=True)
+        elif file_type == 'json':
+            df = spark.read.json(temp_file_path)
+        elif file_type in ['xls', 'xlsx']:
+            pd_df = pd.read_excel(temp_file_path)
+            df = spark.createDataFrame(pd_df)
+        else:
+            st.error("Unsupported file type!")
+            df = None
+        
+        # Clean up the temporary file
+        os.remove(temp_file_path)
 
-df = pd.DataFrame(data)
+        # Sanitize column names
+        if df is not None:
+            df = sanitize_column_names(df)
+        
+        return df
+    return None
 
-st.write(df)
+def dataset_summary(df):
+    # 1. Categorical, Numerical, Ordinal, and Time Variables Identification
+    dtypes = df.dtypes
+    categorical = [name for name, dtype in dtypes if dtype == 'string']
+    numerical = [name for name, dtype in dtypes if dtype in ['int', 'bigint', 'double', 'float']]
+    time = [name for name, dtype in dtypes if dtype == 'timestamp']
+    
+    st.write("Categorical Variables:", categorical)
+    st.write("Numerical Variables:", numerical)
+    st.write("Time Variables:", time)
 
-st.write("Now I want to evaluate the responses from my model. "
-         "One way to achieve this is to use the very powerful `st.data_editor` feature. "
-         "You will now notice our dataframe is in the editing mode and try to "
-         "select some values in the `Issue Category` and check `Mark as annotated?` once finished 👇")
+    # 2. Data Types of Each Column
+    st.write("Data Types:")
+    st.write(pd.DataFrame(dtypes, columns=['Column', 'Data Type']))
 
-df["Issue"] = [True, True, True, False]
-df['Category'] = ["Accuracy", "Accuracy", "Completeness", ""]
+    # 3. Columns with Null Values and Their Counts
+    null_counts_list = []
+    for column in df.columns:
+        null_count = df.filter(F.col(f"`{column}`").isNull()).count()
+        null_counts_list.append((column, null_count))
+    
+    null_counts_df = pd.DataFrame(null_counts_list, columns=['Column', 'Null Count'])
+    st.write("Columns with Null Values:")
+    st.write(null_counts_df)
 
-new_df = st.data_editor(
-    df,
-    column_config = {
-        "Questions":st.column_config.TextColumn(
-            width = "medium",
-            disabled=True
-        ),
-        "Answers":st.column_config.TextColumn(
-            width = "medium",
-            disabled=True
-        ),
-        "Issue":st.column_config.CheckboxColumn(
-            "Mark as annotated?",
-            default = False
-        ),
-        "Category":st.column_config.SelectboxColumn
-        (
-        "Issue Category",
-        help = "select the category",
-        options = ['Accuracy', 'Relevance', 'Coherence', 'Bias', 'Completeness'],
-        required = False
-        )
-    }
-)
+    # 4. Outliers for Numerical Variables
+    outliers = {}
+    for col in numerical:
+        q1, q3 = df.approxQuantile(f"`{col}`", [0.25, 0.75], 0.05)
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        outlier_count = df.filter((F.col(f"`{col}`") < lower_bound) | (F.col(f"`{col}`") > upper_bound)).count()
+        outliers[col] = outlier_count
+    
+    st.write("Outliers for Numerical Variables:")
+    st.write(pd.DataFrame(list(outliers.items()), columns=['Column', 'Outlier Count']))
+    
+    # st.write("Summary Statistics:")
+    # summary_df = df.summary()
+    # st.write(summary_df)
 
-st.write("You will notice that we changed our dataframe and added new data. "
-         "Now it is time to visualize what we have annotated!")
+file = st.file_uploader("Upload your file", type=['csv', 'json', 'xls', 'xlsx'])
+df = read_file(file)
 
-st.divider()
+if df:
+    st.write('\n')
+    st.write('Data Overview:')
+    st.write('\n')
+    st.dataframe(df.toPandas())
 
-st.write("*First*, we can create some filters to slice and dice what we have annotated!")
+st.markdown("# Data Summary")
 
-col1, col2 = st.columns([1,1])
-with col1:
-    issue_filter = st.selectbox("Issues or Non-issues", options = new_df.Issue.unique())
-with col2:
-    category_filter = st.selectbox("Choose a category", options  = new_df[new_df["Issue"]==issue_filter].Category.unique())
-
-st.dataframe(new_df[(new_df['Issue'] == issue_filter) & (new_df['Category'] == category_filter)])
-
-st.markdown("")
-st.write("*Next*, we can visualize our data quickly using `st.metrics` and `st.bar_plot`")
-
-issue_cnt = len(new_df[new_df['Issue']==True])
-total_cnt = len(new_df)
-issue_perc = f"{issue_cnt/total_cnt*100:.0f}%"
-
-col1, col2 = st.columns([1,1])
-with col1:
-    st.metric("Number of responses",issue_cnt)
-with col2:
-    st.metric("Annotation Progress", issue_perc)
-
-df_plot = new_df[new_df['Category']!=''].Category.value_counts().reset_index()
-
-st.bar_chart(df_plot, x = 'Category', y = 'count')
-
-st.write("Here we are at the end of getting started with streamlit! Happy Streamlit-ing! :balloon:")
-
+if df:
+    dataset_summary(df)
